@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 full_pipeline_qwen.py
-Final single-file RAG + local Qwen pipeline.
-- Local model folder: ./qwen_local (change MODEL_PATH below if different)
-- Default behavior: SPEC extraction (unless query starts with 'S:' or 'D:')
-- Ultra-strict JSON enforcement with automatic repair/retry
-- Fallback: safe regex spec extractor (spec-only)
+Single-file RAG + local Qwen pipeline (SPEC-only, strict JSON).
+- Model folder: ./qwen7_local
+- Default behavior: SPEC extraction (single best match)
+- Strict JSON enforcement with retry
+- Regex fallback (spec-only)
 """
 import os
 import re
 import json
 import argparse
 from collections import Counter
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from tqdm import tqdm
 
 # Core libs
@@ -31,7 +31,7 @@ try:
 except Exception as e:
     raise ImportError("faiss not installed. pip install faiss-cpu (or use conda)") from e
 
-# transformers (required for LLM)
+# transformers (required for local LLM)
 HAS_TRANSFORMERS = True
 try:
     import torch
@@ -42,11 +42,12 @@ except Exception:
 # ---------------------------
 # Configuration
 # ---------------------------
-MODEL_PATH = "./qwen7_local"            # << confirmed by you
-HF_CACHE_DIR = "./models"              # HF cache for tokenizers etc (kept local)
+MODEL_PATH = "./qwen7_local"
+HF_CACHE_DIR = "./models"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_CHARS_PER_CHUNK = 1500
 TOP_K = 6
+LLM_MAX_RETRIES = 4
 
 # Regexes & helpers for cleaning & chunking
 PAGE_NUM_PAT = re.compile(r'(^|\s)(\d+\s*[-–]\s*\d+|\d+/\d+|\bPage\s*\d+\b|\bpg\.\s*\d+\b|\b\d+\b)(\s|$)', flags=re.IGNORECASE)
@@ -70,7 +71,9 @@ UNIT_NORMALIZATIONS = {
 
 SUSPECT_HEADER_WORDS = ['SERVICE SPECIFICATIONS', 'SPECIFICATIONS', 'BRAKES', 'TORQUE', 'SERVICE MANUAL']
 
-# Ultra-strict master prompt: instruct model to print JSON ONLY and wrap result with <JSON>... </JSON>
+# ---------------------------
+# Ultra-strict master prompt (SPEC-only)
+# ---------------------------
 MASTER_PROMPT = """
 You are an automotive service-manual SPEC extractor.
 Use ONLY the context provided below. Never invent values.
@@ -79,7 +82,7 @@ OUTPUT RULES (MANDATORY):
 - You MUST output ONLY valid JSON.
 - Wrap JSON ONLY inside:
   <JSON>
-  [...]
+  [...spec array...]
   </JSON>
 - Absolutely no explanation, no notes, no commentary.
 - JSON must be a SINGLE array of SPEC objects.
@@ -119,10 +122,22 @@ SPEC FORMAT (REQUIRED):
 ]
 </JSON>
 
-Return ONLY the JSON. No text outside <JSON>…</JSON>.
+Examples:
+Query: "torque for engine mount bolt"
+Expected JSON:
+<JSON>
+[
+  {
+    "component": "engine mount bolt",
+    "spec_type": "Torque",
+    "value": "55",
+    "unit": "Nm"
+  }
+]
+</JSON>
+
+Return ONLY the JSON wrapped by <JSON>... </JSON>. No extra text.
 """
-
-
 
 # ---------------------------
 # PDF extraction & cleaning
@@ -399,64 +414,75 @@ def safe_json_load(s: str):
             return None
 
 # ---------------------------
-# LLM call with strict-retry semantics
+# LLM call with strict-retry semantics (REPLACED)
 # ---------------------------
-def call_local_qwen_strict(context_text: str, query: str, model_path: str = MODEL_PATH, cache_dir: str = HF_CACHE_DIR, max_retries: int = 2):
-    """Call local Qwen, enforce JSON-only output. Will attempt a repair prompt if first output is invalid."""
+
+def call_local_qwen_strict(context_text: str, query: str, model_path: str = MODEL_PATH, cache_dir: str = HF_CACHE_DIR, max_retries: int = LLM_MAX_RETRIES) -> Tuple[Any, str]:
+    """
+    STRICT SPEC-ONLY extractor.
+    - Forces model to output ONLY <JSON> ... </JSON>
+    - Retries until valid JSON is produced (max_retries)
+    - Returns (parsed_json, raw_text_or_last_error)
+    """
     if not HAS_TRANSFORMERS:
-        raise RuntimeError("transformers/torch not available.")
-    # load tokenizer & model once (cached)
+        raise RuntimeError("transformers not available")
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, cache_dir=cache_dir, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path,
-                                                 cache_dir=cache_dir,
-                                                 device_map="auto",
-                                                 torch_dtype=torch.float16,
-                                                 low_cpu_mem_usage=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        cache_dir=cache_dir,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
     model.eval()
     device = next(model.parameters()).device
 
-    system_prompt = MASTER_PROMPT.format(context=context_text, query=query)
+    prompt = MASTER_PROMPT.format(context=context_text, query=query)
 
-    # try initial generation
-    def gen(prompt_text):
-        inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=4096)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        out = model.generate(**inputs, max_new_tokens=1024, do_sample=False)
-        decoded = tokenizer.decode(out[0], skip_special_tokens=True)
-        return decoded
+    def gen(p: str) -> str:
+        enc = tokenizer(p, return_tensors="pt", truncation=True, max_length=4096)
+        enc = {k: v.to(device) for k, v in enc.items()}
+        out = model.generate(**enc, max_new_tokens=1024, do_sample=False)
+        return tokenizer.decode(out[0], skip_special_tokens=True)
 
-    # 1st attempt
-    try:
-        raw = gen(system_prompt)
-        parsed = safe_json_load(raw)
-        if parsed is not None:
-            return parsed, raw
-    except Exception as e:
-        # allow retry below
-        raw = None
+    last_raw = None
+    for attempt in range(max_retries):
+        raw = gen(prompt)
+        last_raw = raw
 
-    # 2nd attempt: ask model to OUTPUT ONLY JSON between tags (explicit repair instruction)
-    repair_prompt = system_prompt + "\n\nIMPORTANT: You must now output ONLY the JSON wrapped inside <JSON> ... </JSON> and nothing else."
-    try:
-        raw2 = gen(repair_prompt)
-        parsed2 = safe_json_load(raw2)
-        if parsed2 is not None:
-            return parsed2, raw2
-    except Exception:
-        raw2 = None
+        
+# Try to extract <JSON>...</JSON> first
+        m = re.search(r"<JSON>(.*)</JSON>", raw, flags=re.DOTALL)
+        if m:
+            body = m.group(1).strip()
+        else:
+            # fallback: try to parse ANY JSON substring
+            body = extract_json_substring(raw)
 
-    # optionally additional retries (one more)
-    if max_retries > 2:
+        if not body:
+            prompt += "\nYou MUST output ONLY valid JSON inside <JSON>...</JSON>."
+            continue
+
+# Now try to parse
         try:
-            raw3 = gen(repair_prompt)
-            parsed3 = safe_json_load(raw3)
-            if parsed3 is not None:
-                return parsed3, raw3
+            parsed = json.loads(body)
+            return parsed, raw
         except Exception:
-            raw3 = None
+            prompt += "\nYour previous JSON was invalid. Output clean JSON ONLY."
+            continue
 
-    # nothing worked
-    return None, raw or raw2
+        body = m.group(1).strip()
+        try:
+            parsed = json.loads(body)
+            return parsed, raw
+        except Exception:
+            # invalid JSON, tighten and retry
+            prompt += "\nPrevious output was not valid JSON. Output only valid JSON inside <JSON>...</JSON>."
+            continue
+
+    # failed to get valid JSON
+    return None, last_raw
 
 # ---------------------------
 # Regex fallback for SPEC mode (clean)
@@ -507,6 +533,28 @@ def guess_spec_type_from_component(comp: str) -> str:
     return "Specification"
 
 # ---------------------------
+# Scoring helpers (to choose single best)
+# ---------------------------
+def score_candidate_by_query(candidate: Dict[str,str], query: str) -> float:
+    """
+    Score candidate by (keyword overlap) + (component contains query terms).
+    Higher is better. Returns float score.
+    """
+    q_terms = re.findall(r'\w+', query.lower())
+    comp = candidate.get("component","").lower()
+    score = 0.0
+    for t in q_terms:
+        if t in comp:
+            score += 2.0
+    # small boost if spec_type contains 'torque' and query mentions torque
+    if 'torque' in query.lower() and candidate.get("spec_type","").lower() == "torque":
+        score += 1.0
+    # numeric presence boost (value non-empty)
+    if candidate.get("value"):
+        score += 0.5
+    return score
+
+# ---------------------------
 # Orchestration: build / query
 # ---------------------------
 def build_pipeline(pdf_folder: str, outdir: str):
@@ -535,95 +583,94 @@ def build_pipeline(pdf_folder: str, outdir: str):
     print("Build finished.")
 
 def query_and_extract(user_query: str, outdir: str, top_k: int = TOP_K, out_file: str = None):
-    # Mode detection by prefix
     mode = "spec"
     q_clean = user_query.strip()
-    
 
     print(f"Mode = {mode}. Query => {q_clean}")
 
+    # retrieve top-k, but we'll pass reduced context (recommend top_k=1 for stability)
     results = retrieve(q_clean, outdir, top_k=top_k, embed_model_name=EMBED_MODEL)
     if not results:
         print("No chunks retrieved. Exiting.")
         return
 
-    combined_context = "\n\n".join([f"--- Page: {r['page']} Section: {r['section']} ---\n{r['text']}" for r in results])
+    # combine only top 1 chunk for strictness; still provide a little surrounding context: take ranks 1..min(3,top_k)
+    take_k = min(3, len(results))
+    combined_context = "\n\n".join([f"--- Page: {r['page']} Section: {r['section']} ---\n{r['text']}" for r in results[:take_k]])
 
-    # prefer strict LLM extraction (only for environments where transformers are available)
     final_output = None
+    # Attempt LLM extraction if available
     if HAS_TRANSFORMERS:
         try:
-            parsed, raw_text = call_local_qwen_strict(combined_context, q_clean, model_path=MODEL_PATH, cache_dir=HF_CACHE_DIR, max_retries=3)
-            if parsed is None:
-                raise ValueError("LLM did not return parseable JSON")
-            # If mode == spec, coerce output to list of spec objects
-            # STRICT: final_output must be a single array
-            if isinstance(parsed, list):
-                final_output = parsed
-            elif isinstance(parsed, dict):
-                if "error" in parsed:
-                    final_output = parsed
-                else:
-                    final_output = [parsed]
-            else:
-                final_output = {"error": "Invalid JSON structure"}
-
-                # parsed can be list or object
-                if isinstance(parsed, dict):
-                    # maybe dict contains array under some key
-                    # find first list value
-                    arr = None
-                    for v in parsed.values():
-                        if isinstance(v, list):
-                            arr = v
-                            break
-                    if arr is None:
-                        # maybe single object representing one spec
-                        arr = [parsed]
-                    parsed = arr
-                # sanitize items
-                sanitized = []
-                for it in parsed:
+            parsed, raw_text = call_local_qwen_strict(combined_context, q_clean, model_path=MODEL_PATH, cache_dir=HF_CACHE_DIR, max_retries=LLM_MAX_RETRIES)
+            if parsed is not None:
+                # parsed must be either list or dict with error
+                candidates = []
+                if isinstance(parsed, list):
+                    candidates = parsed
+                elif isinstance(parsed, dict):
+                    if "error" in parsed:
+                        final_output = parsed
+                    else:
+                        candidates = [parsed]
+                # ensure candidates are dicts with required fields
+                cleaned_cands = []
+                for it in candidates:
                     if not isinstance(it, dict):
                         continue
-                    sanitized.append({
-                        "component": str(it.get("component","")).strip(),
-                        "spec_type": str(it.get("spec_type","")).strip(),
-                        "value": str(it.get("value","")).strip(),
-                        "unit": str(it.get("unit","")).strip()
-                    })
-                final_output = sanitized
-     else:
-                final_output = parsed
-            print("✅ LLM provided structured JSON.")
+                    comp = str(it.get("component","")).strip()
+                    spec_type = str(it.get("spec_type","")).strip()
+                    value = str(it.get("value","")).strip()
+                    unit = str(it.get("unit","")).strip()
+                    if comp and value:
+                        cleaned_cands.append({
+                            "component": comp,
+                            "spec_type": spec_type or "Specification",
+                            "value": value,
+                            "unit": unit
+                        })
+                # pick single best candidate by scoring
+                if cleaned_cands:
+                    scored = sorted(cleaned_cands, key=lambda x: score_candidate_by_query(x, q_clean), reverse=True)
+                    final_output = [scored[0]]  # single result
+                else:
+                    # LLM returned nothing usable
+                    final_output = None
+            else:
+                final_output = None
         except Exception as e:
-            print("⚠️ LLM failed or JSON invalid:", str(e))
+            print("⚠️ LLM failed:", e)
+            final_output = None
 
+    # If LLM failed, use regex fallback and pick best
     if final_output is None:
-        # fallback: SPEC-only regex extraction
-        if mode != "spec":
-            print("No reliable LLM output and mode is not SPEC. Returning insufficient data.")
-            final_output = {"error": "Insufficient LLM output and fallback only supports SPEC mode."}
+        agg_text = "\n\n".join([r['text'] for r in results[:min(6,len(results))]])
+        specs = regex_spec_extract(agg_text)
+        if not specs:
+            final_output = {"error": "Insufficient data"}
         else:
-            agg_text = "\n\n".join([r['text'] for r in results])
-            specs = regex_spec_extract(agg_text)
-            # optionally prioritize matches that mention key terms from query
-            query_terms = re.findall(r'\w+', q_clean.lower())
-            def score_spec(s):
-                comp = s['component'].lower()
-                return sum(1 for t in query_terms if t in comp)
-            specs_sorted = sorted(specs, key=score_spec, reverse=True)
-            final_output = specs_sorted
-            print(f"✅ Regex fallback returned {len(final_output)} items.")
+            # score and choose single best
+            scored = sorted(specs, key=lambda x: score_candidate_by_query(x, q_clean), reverse=True)
+            final_output = [scored[0]]
 
-    out_json = json.dumps(final_output, ensure_ascii=False, indent=2)
+    # Final output must be single-element array or error dict
+    if isinstance(final_output, dict) and "error" in final_output:
+        out_json = json.dumps(final_output, ensure_ascii=False, indent=2)
+    else:
+        # ensure list
+        if isinstance(final_output, list):
+            out_json = json.dumps(final_output, ensure_ascii=False, indent=2)
+        else:
+            out_json = json.dumps({"error":"Invalid result"}, ensure_ascii=False, indent=2)
+
     if out_file:
         with open(out_file, 'w', encoding='utf-8') as f:
             f.write(out_json)
+        print(out_json)
         print(f"✅ Output saved to {out_file}")
     else:
-        print("\n--- OUTPUT ---\n")
         print(out_json)
+
     return final_output
 
 # ---------------------------
@@ -636,7 +683,7 @@ def main():
     parser.add_argument("--outdir", default="./data", help="where to save artifacts")
     parser.add_argument("--query", type=str, help="query text (use quotes)")
     parser.add_argument("--query_file", type=str, help="path to .txt file containing query")
-    parser.add_argument("--topk", type=int, default=TOP_K, help="top-k chunks to retrieve")
+    parser.add_argument("--topk", type=int, default=1, help="top-k chunks to retrieve (use 1 for strictness)")
     parser.add_argument("--out", type=str, help="file to save final JSON output")
     args = parser.parse_args()
 
